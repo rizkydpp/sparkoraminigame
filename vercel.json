@@ -1,5 +1,11 @@
 {
   "cleanUrls": true,
-  "rewrites": [{ "source": "/admin", "destination": "/index.html" }],
-  "headers": [{ "source": "/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=300" }] }]
+  "rewrites": [
+    { "source": "/admin", "destination": "/index.html" },
+    { "source": "/tv", "destination": "/display.html" }
+  ],
+  "headers": [
+    { "source": "/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=60" }] },
+    { "source": "/config.js", "headers": [{ "key": "Cache-Control", "value": "no-cache" }] }
+  ]
 }

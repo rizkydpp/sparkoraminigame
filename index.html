@@ -406,6 +406,8 @@ body.ev-fireup #scr-game::before{content:"";position:absolute;inset:0;pointer-ev
 </div>
 <div class="toast" id="toast"></div>
 
+<!-- Shared settings (Google Sheet API URL, rewards, game URL). Optional: without it the game runs offline on each phone. -->
+<script src="config.js"></script>
 <script>
 'use strict';
 /* =========================================================================
@@ -454,9 +456,9 @@ const DEFAULT_CONFIG = {
   //   ~7.5 taps/s scores   ~3,050-3,500     -> MASTER
   //   ~10 taps/s scores    ~3,550-4,050     -> LEGEND
   rewards: [
-    { minScore: 2400, title: 'SPARKORA FAN',    reward: 'FREE TOPPING' },
+    { minScore: 2400, title: 'SPARKORA FAN',    reward: 'FREE TOYS' },
     { minScore: 3200, title: 'GRILL MASTER',    reward: 'FREE DRINK' },
-    { minScore: 3700, title: 'SPARKORA LEGEND', reward: 'SPECIAL VOUCHER' }
+    { minScore: 3700, title: 'SPARKORA LEGEND', reward: 'SPECIAL MERCHANDISE' }
   ]
 };
 
@@ -473,7 +475,8 @@ const KEYS = { board:'spk.leaderboard', codes:'spk.codes', config:'spk.config', 
 
 let CFG = loadConfig();
 function loadConfig(){
-  const o = Store.get(KEYS.config, {});
+  const shared = window.SPARKORA_CONFIG || {};
+  const o = Object.assign({}, shared, Store.get(KEYS.config, {}));  // defaults < config.js < this device's admin overrides
   const c = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   for (const k in o){ if (k in c) c[k] = (k === 'EVENT_WEIGHTS') ? Object.assign(c[k], o[k]) : o[k]; }
   c.rewards = (c.rewards || []).slice().sort((a,b) => a.minScore - b.minScore);
@@ -482,21 +485,48 @@ function loadConfig(){
 
 /* =========================================================================
    3. LEADERBOARD SERVICE
-   Async interface so localStorage can be swapped for Firebase / Supabase
-   without touching gameplay. Replace the bodies of these 4 methods.
+   Gameplay only talks to `Leaderboard`. When config.js has SHEET_API_URL
+   (Google Apps Script Web App), scores go to Google Sheets and every phone
+   + the big-screen display share one board. Otherwise each phone keeps its own.
    ========================================================================= */
-const Leaderboard = {
-  async all(){ return Store.get(KEYS.board, []); },
-  async add(entry){
-    const list = Store.get(KEYS.board, []);
-    list.push(entry);
-    list.sort(rankSort);
-    Store.set(KEYS.board, list.slice(0, 500));
-    return entry;
-  },
+const OUTLET = (new URLSearchParams(location.search).get('outlet') || '').slice(0, 40) || null;
+const SHEET_API = (() => { const u = ((window.SPARKORA_CONFIG || {}).SHEET_API_URL || '').trim(); return /^https:\/\/script\.google(usercontent)?\.com\//.test(u) || /^https?:\/\/localhost/.test(u) ? u : null; })();
+// GET for reads, POST with a plain-text body for writes (no CORS preflight → works with Apps Script).
+async function sheetApi(params, body){
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const r = body
+      ? await fetch(SHEET_API, { method: 'POST', body: JSON.stringify(body), redirect: 'follow', signal: ctl.signal })
+      : await fetch(SHEET_API + '?' + new URLSearchParams(params), { redirect: 'follow', cache: 'no-store', signal: ctl.signal });
+    const j = await r.json(); if (!j.ok) throw new Error(j.error || 'Sheet API error'); return j;
+  } finally { clearTimeout(t); }
+}
+
+const LocalBoard = {
+  online: false,
+  list(scope){ const all = Store.get(KEYS.board, []).filter(e => !OUTLET || e.outlet === OUTLET).sort(rankSort); return scope === 'today' ? all.filter(e => e.day === todayKey()) : all; },
+  async board(scope, n, entry){ const l = this.list(scope); const i = entry ? l.findIndex(e => e.id === entry.id) : -1; return { top: l.slice(0, n), rank: i < 0 ? -1 : i + 1 }; },
+  async add(entry){ const list = Store.get(KEYS.board, []); list.push(entry); list.sort(rankSort); Store.set(KEYS.board, list.slice(0, 500)); return entry; },
+  async all(){ return Store.get(KEYS.board, []).slice().sort(rankSort); },
   async remove(id){ Store.set(KEYS.board, Store.get(KEYS.board, []).filter(e => e.id !== id)); },
   async reset(){ Store.del(KEYS.board); }
 };
+const SheetBoard = {
+  online: true,
+  async board(scope, n, entry){
+    const p = { action: 'board', scope, limit: n }; if (OUTLET) p.outlet = OUTLET; if (entry) p.id = entry.id;
+    const j = await sheetApi(p);
+    return { top: j.top.map(e => Object.assign(e, { time: e.time === '' || e.time == null ? null : +e.time })), rank: j.rank || -1 };
+  },
+  async add(entry){
+    await sheetApi(null, { action: 'add', id: entry.id, name: entry.name, score: entry.score, time: entry.time, taps: entry.taps, outlet: OUTLET || '' });
+    return entry;
+  },
+  async all(){ return (await this.board('all', 50)).top; },
+  async remove(){ throw new Error('Hide rows in the Google Sheet'); },
+  async reset(){ throw new Error('Clear rows in the Google Sheet'); }
+};
+const Leaderboard = SHEET_API ? SheetBoard : LocalBoard;
 function rankSort(a, b){ return (b.score - a.score) || ((a.time ?? 1e9) - (b.time ?? 1e9)) || (a.ts - b.ts); }
 function todayKey(d = new Date()){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
 
@@ -529,6 +559,7 @@ const Rewards = {
     do { code = CFG.REWARD_CODE_PREFIX + '-' + randCode(4); } while (codes.some(c => c.code === code));
     const rec = { code, tier: tier.title, reward: tier.reward, score: result.score, name, ts: Date.now(), day: todayKey(), device: deviceId() };
     codes.push(rec); Store.set(KEYS.codes, codes.slice(-2000));
+    if (SHEET_API) sheetApi(null, Object.assign({ action: 'reward', outlet: OUTLET || '' }, rec)).catch(() => {}); // log for staff to verify
     return rec;
   }
 };
@@ -1024,7 +1055,7 @@ const UI = (() => {
 
   // ---------- result
   function showResult(r){
-    session = { entryId: null, name: null, claimed: null };
+    session = { entryId: null, entry: null, name: null, claimed: null, offline: false };
     const card = $('#resultCard'); const tier = r.tier;
     if (r.perfect){
       const flames = tier ? '🔥'.repeat(Math.min(3, tier.level)) : '';
@@ -1078,30 +1109,40 @@ const UI = (() => {
   function openName(){ nameInput.maxLength = CFG.NAME_MAX_LENGTH; $('#nameMax').textContent = CFG.NAME_MAX_LENGTH;
     nameInput.value = Store.get('spk.lastName', ''); $('#nameCount').textContent = nameInput.value.length;
     $('#btnSkipName').textContent = 'Skip, play as ' + CFG.DEFAULT_PLAYER_NAME; show('name'); setTimeout(() => nameInput.focus(), 350); }
+  let submitting = false;
   async function submitName(raw){
+    if (submitting || session.entryId) { if (session.entryId) openBoard('after'); return; }
+    submitting = true; $('#btnSubmitName').disabled = true; $('#btnSubmitName').textContent = 'SUBMITTING…';
     const name = (raw || '').trim() || CFG.DEFAULT_PLAYER_NAME; nameInput.blur();
     if ((raw || '').trim()) Store.set('spk.lastName', name);
-    const r = G.result; const entry = { id: 'E' + Date.now().toString(36) + randCode(3), name, score: r.score, time: r.time, taps: r.taps, ts: Date.now(), day: todayKey() };
-    await Leaderboard.add(entry); session.entryId = entry.id; session.name = name;
+    const r = G.result; const entry = { id: 'E' + Date.now().toString(36) + randCode(4), name, score: r.score, time: r.time, taps: r.taps, ts: Date.now(), day: todayKey(), outlet: OUTLET };
+    try { await Leaderboard.add(entry); session.offline = false; }
+    catch (e) { await LocalBoard.add(entry); session.offline = true; toast('Connection problem, score saved on this phone'); }
+    session.entryId = entry.id; session.entry = entry; session.name = name;
+    submitting = false; $('#btnSubmitName').disabled = false; $('#btnSubmitName').textContent = 'SUBMIT SCORE';
     openBoard('after');
   }
   $('#btnSubmitName').onclick = () => submitName(nameInput.value);
   $('#btnSkipName').onclick = () => submitName('');
 
   // ---------- leaderboard
-  let boardTab = 'today', boardMode = 'view';
+  let boardTab = 'today', boardMode = 'view', boardToken = 0;
   $('#tabToday').onclick = () => { boardTab = 'today'; renderBoard(); };
   $('#tabAll').onclick = () => { boardTab = 'all'; renderBoard(); };
-  function openBoard(mode){ boardMode = mode; boardTab = 'today'; show('board'); renderBoard(); }
+  function openBoard(mode){ boardMode = mode; boardTab = 'today'; $('#boardBody').innerHTML = '<div class="empty">Loading champions…</div>'; $('#boardYours').innerHTML = ''; show('board'); renderBoard(); }
   async function renderBoard(){
     $('#tabToday').classList.toggle('on', boardTab === 'today'); $('#tabAll').classList.toggle('on', boardTab === 'all');
-    const all = (await Leaderboard.all()).slice().sort(rankSort);
-    const list = boardTab === 'today' ? all.filter(e => e.day === todayKey()) : all;
-    const top = list.slice(0, CFG.LEADERBOARD_SIZE); const myRank = list.findIndex(e => e.id === session.entryId);
-    $('#boardBody').innerHTML = top.length ? `<table class="lb"><thead><tr><th>#</th><th>NAME</th><th>SCORE</th><th>TIME</th></tr></thead><tbody>${
+    const token = ++boardToken, board = session.offline ? LocalBoard : Leaderboard;
+        let top = [], rank = -1, failed = false;
+    try { const b = await board.board(boardTab, CFG.LEADERBOARD_SIZE, session.entry); top = b.top; rank = b.rank; }
+    catch (e) { failed = true; }
+    if (token !== boardToken) return;
+    if (failed){ $('#boardBody').innerHTML = '<div class="empty">Can\'t reach the leaderboard. Check your connection and try again.</div>'; }
+    const myRank = rank - 1;
+    if (!failed) $('#boardBody').innerHTML = top.length ? `<table class="lb"><thead><tr><th>#</th><th>NAME</th><th>SCORE</th><th>TIME</th></tr></thead><tbody>${
       top.map((e, i) => `<tr class="${i < 3 ? 'r' + (i + 1) : ''} ${e.id === session.entryId ? 'me' : ''}"><td>${i === 0 ? '👑' : i + 1}</td><td class="nm">${esc(e.name)}</td><td>${fmt(e.score)}</td><td>${e.time != null ? e.time.toFixed(2) + 's' : '—'}</td></tr>`).join('')
     }</tbody></table>` : `<div class="empty">No champions yet today. Be the first on the board!</div>`;
-    const me = myRank >= 0 ? list[myRank] : null;
+    const me = !failed && myRank >= 0 ? session.entry : null;
     $('#boardYours').innerHTML = me ? `<div class="yours"><span><small>YOUR RESULT</small><b>#${myRank + 1}</b></span><span class="nm">${esc(me.name)}</span><b>${fmt(me.score)}</b><span>${me.time != null ? me.time.toFixed(2) + 's' : ''}</span></div>` : '';
     const acts = $('#boardActions');
     if (boardMode === 'after' && G.result && G.result.tier){
@@ -1173,7 +1214,8 @@ const Admin = (() => {
     $('#admGo').onclick = go; $('#admPin').onkeydown = e => { if (e.key === 'Enter') go(); }; $('#admExit').onclick = exit; setTimeout(() => $('#admPin').focus(), 50);
   }
   async function render(){
-    const board = (await Leaderboard.all()).slice().sort(rankSort), codes = Store.get(KEYS.codes, []);
+    let board = []; try { board = await Leaderboard.all(); } catch (e) {}
+    const codes = Store.get(KEYS.codes, []), ON = Leaderboard.online;
     const w = CFG.EVENT_WEIGHTS;
     el.innerHTML = `
       <div class="adm-row" style="justify-content:space-between;align-items:center"><h2>Admin / test mode</h2><button class="abtn alt" id="admExit">Exit</button></div>
@@ -1191,9 +1233,10 @@ const Admin = (() => {
       <h3>Test flows</h3>
       <div class="adm-row"><button class="abtn alt" data-test="win">Test WIN</button><button class="abtn alt" data-test="fail">Test TIME'S UP</button>
         ${CFG.rewards.map((r, i) => `<button class="abtn alt" data-tier="${i}">Preview ${esc(r.title)}</button>`).join('')}<button class="abtn alt" data-test="play">Play now</button></div>
-      <h3>Leaderboard (${board.length})</h3>
-      <div class="adm-row" style="margin-bottom:8px"><button class="abtn alt" id="admSeed">Add 10 test scores</button><button class="abtn warn" id="admResetBoard">Reset leaderboard</button></div>
-      <div class="adm-list">${board.length ? board.slice(0, 100).map(e => `<div><span>${esc(e.name)} · ${fmt(e.score)} · ${e.time != null ? e.time.toFixed(2) + 's' : '—'} · ${e.day}</span><button data-del="${e.id}">Remove</button></div>`).join('') : '<div>Empty</div>'}</div>
+      <h3>Leaderboard: ${ON ? 'ONLINE (Google Sheets)' : 'this phone only'} (${board.length}${ON ? ' shown' : ''})</h3>
+      ${ON ? `<p style="font-size:13px;color:var(--muted);margin:0 0 8px">Hide a name: type X in the “Hide” column of the Scores sheet. Reset: delete the rows.</p>`
+           : `<div class="adm-row" style="margin-bottom:8px"><button class="abtn alt" id="admSeed">Add 10 test scores</button><button class="abtn warn" id="admResetBoard">Reset leaderboard</button></div>`}
+      <div class="adm-list">${board.length ? board.slice(0, 100).map(e => `<div><span>${esc(e.name)} · ${fmt(e.score)} · ${e.time != null ? e.time.toFixed(2) + 's' : '—'} · ${e.day || (e.created_at || '').slice(0, 10)}</span>${ON ? '' : `<button data-del="${e.id}">Remove</button>`}</div>`).join('') : '<div>Empty</div>'}</div>
       <h3>Issued reward codes (${codes.length})</h3>
       <div class="adm-list">${codes.length ? codes.slice().reverse().slice(0, 100).map(c => `<div><span><b>${esc(c.code)}</b> · ${esc(c.reward)} · ${esc(c.name)} · ${new Date(c.ts).toLocaleString('en-GB')}</span></div>`).join('') : '<div>None yet</div>'}</div>
       <h3>Danger zone</h3>
@@ -1203,10 +1246,10 @@ const Admin = (() => {
     $('#admDefaults').onclick = () => { Store.del(KEYS.config); CFG = loadConfig(); toast('Defaults restored'); render(); };
     $('#admAddTier').onclick = () => { $('#admTiers').insertAdjacentHTML('beforeend', tierRow({ minScore: 0, title: 'NEW TIER', reward: 'REWARD' })); };
     $('#admTiers').onclick = e => { if (e.target.matches('[data-rm]')) e.target.closest('.rw').remove(); };
-    $('#admSeed').onclick = async () => { const names = ['KEVIN', 'JASON', 'SARAH', 'MEI', 'BUDI', 'RINA', 'ANDRE', 'SISKA', 'TONO', 'LALA'];
+    if (!ON) $('#admSeed').onclick = async () => { const names = ['KEVIN', 'JASON', 'SARAH', 'MEI', 'BUDI', 'RINA', 'ANDRE', 'SISKA', 'TONO', 'LALA'];
       for (const n of names) await Leaderboard.add({ id: 'T' + randCode(8), name: n, score: 1800 + Math.floor(Math.random() * 1400), time: +(14 + Math.random() * 15).toFixed(2), taps: CFG.BASE_TAPS_TO_COMPLETE, ts: Date.now(), day: todayKey() });
       toast('Added 10 test scores'); render(); };
-    $('#admResetBoard').onclick = async () => { if (confirm('Delete every leaderboard entry on this device?')){ await Leaderboard.reset(); toast('Leaderboard reset'); render(); } };
+    if (!ON) $('#admResetBoard').onclick = async () => { if (confirm('Delete every leaderboard entry on this device?')){ await Leaderboard.reset(); toast('Leaderboard reset'); render(); } };
     $('#admClearAll').onclick = () => { if (confirm('Clear leaderboard, reward codes, settings and sound preference on this device?')){ Store.clearAll(); CFG = loadConfig(); toast('All data cleared'); render(); } };
     el.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => { await Leaderboard.remove(b.dataset.del); render(); });
     el.querySelectorAll('[data-test]').forEach(b => b.onclick = () => runTest(b.dataset.test));
