@@ -12,8 +12,8 @@ window.SPARKORA_CONFIG = {
 
   // 3) Reward tiers (used by the game and shown on the big screen).
   rewards: [
-    { minScore: 2400, title: 'SPARKORA FAN',    reward: 'FREE TOYS' },
-    { minScore: 3200, title: 'GRILL MASTER',    reward: 'FREE DRINK' },
-    { minScore: 3700, title: 'SPARKORA LEGEND', reward: 'SPECIAL MERCHANDISE' }
+    { minScore: 2500, title: 'SPARKORA FAN',    reward: 'FREE TOYS' },
+    { minScore: 3500, title: 'GRILL MASTER',    reward: 'FREE DRINK' },
+    { minScore: 3900, title: 'SPARKORA LEGEND', reward: 'SPECIAL MERCHANDISE' }
   ]
 };
