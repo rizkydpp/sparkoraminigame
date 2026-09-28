@@ -513,20 +513,27 @@ const LocalBoard = {
 };
 const SheetBoard = {
   online: true,
+  norm(j){ return { top: (j.top || []).map(e => Object.assign(e, { time: e.time === '' || e.time == null ? null : +e.time })), rank: j.rank || -1 }; },
   async board(scope, n, entry){
     const p = { action: 'board', scope, limit: n }; if (OUTLET) p.outlet = OUTLET; if (entry) p.id = entry.id;
-    const j = await sheetApi(p);
-    return { top: j.top.map(e => Object.assign(e, { time: e.time === '' || e.time == null ? null : +e.time })), rank: j.rank || -1 };
+    return this.norm(await sheetApi(p));
   },
-  async add(entry){
-    await sheetApi(null, { action: 'add', id: entry.id, name: entry.name, score: entry.score, time: entry.time, taps: entry.taps, outlet: OUTLET || '' });
-    return entry;
+  // one round trip: saves the score AND returns today's board with the player's rank
+  async add(entry, n = 10){
+    return this.norm(await sheetApi(null, { action: 'add', id: entry.id, name: entry.name, score: entry.score, time: entry.time, taps: entry.taps, outlet: entry.outlet || OUTLET || '', limit: n }));
   },
   async all(){ return (await this.board('all', 50)).top; },
   async remove(){ throw new Error('Hide rows in the Google Sheet'); },
   async reset(){ throw new Error('Clear rows in the Google Sheet'); }
 };
 const Leaderboard = SHEET_API ? SheetBoard : LocalBoard;
+// Scores that couldn't be sent (bad signal) are retried on the next submit / page load.
+const Pending = {
+  get: () => Store.get('spk.pending', []),
+  push(e){ const l = this.get(); if (!l.some(x => x.id === e.id)) l.push(e); Store.set('spk.pending', l.slice(-20)); },
+  async flush(){ if (!SHEET_API) return; for (const e of this.get()){ try { await SheetBoard.add(e); Store.set('spk.pending', this.get().filter(x => x.id !== e.id)); } catch (err) { return; } } }
+};
+const warmUp = () => { if (SHEET_API) sheetApi({ action: 'ping' }).catch(() => {}); };  // wakes Apps Script before it's needed
 function rankSort(a, b){ return (b.score - a.score) || ((a.time ?? 1e9) - (b.time ?? 1e9)) || (a.ts - b.ts); }
 function todayKey(d = new Date()){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
 
@@ -917,7 +924,7 @@ function registerTap(x, y){
 
 function startCountdown(){
   resetGame(); FX.S.p = 0; FX.S.pDraw = 0; FX.S.heat = 0.25; FX.S.fire = 1;
-  Sfx.init(); Sfx.ignite(); FX.layout('game');
+  Sfx.init(); Sfx.ignite(); FX.layout('game'); warmUp();
   UI.show('count'); G.state = 'countdown';
   const seq = ['3', '2', '1', '🔥 FIRE UP!']; let i = 0;
   const step = () => {
@@ -1055,7 +1062,8 @@ const UI = (() => {
 
   // ---------- result
   function showResult(r){
-    session = { entryId: null, entry: null, name: null, claimed: null, offline: false };
+    session = { entryId: null, entry: null, name: null, claimed: null, offline: false, pendingAdd: null, serverToday: null,
+      prefetch: r.perfect && Leaderboard.online ? Leaderboard.board('today', CFG.LEADERBOARD_SIZE).catch(() => null) : null };
     const card = $('#resultCard'); const tier = r.tier;
     if (r.perfect){
       const flames = tier ? '🔥'.repeat(Math.min(3, tier.level)) : '';
@@ -1109,17 +1117,20 @@ const UI = (() => {
   function openName(){ nameInput.maxLength = CFG.NAME_MAX_LENGTH; $('#nameMax').textContent = CFG.NAME_MAX_LENGTH;
     nameInput.value = Store.get('spk.lastName', ''); $('#nameCount').textContent = nameInput.value.length;
     $('#btnSkipName').textContent = 'Skip, play as ' + CFG.DEFAULT_PLAYER_NAME; show('name'); setTimeout(() => nameInput.focus(), 350); }
-  let submitting = false;
+  // Submit is instant: the board shows straight away (built from a leaderboard fetched
+  // while the player typed their name). The save to Google Sheets runs in the background
+  // and the board quietly refreshes with the official rank when it answers.
   async function submitName(raw){
-    if (submitting || session.entryId) { if (session.entryId) openBoard('after'); return; }
-    submitting = true; $('#btnSubmitName').disabled = true; $('#btnSubmitName').textContent = 'SUBMITTING…';
+    if (session.entryId){ openBoard('after'); return; }
     const name = (raw || '').trim() || CFG.DEFAULT_PLAYER_NAME; nameInput.blur();
     if ((raw || '').trim()) Store.set('spk.lastName', name);
     const r = G.result; const entry = { id: 'E' + Date.now().toString(36) + randCode(4), name, score: r.score, time: r.time, taps: r.taps, ts: Date.now(), day: todayKey(), outlet: OUTLET };
-    try { await Leaderboard.add(entry); session.offline = false; }
-    catch (e) { await LocalBoard.add(entry); session.offline = true; toast('Connection problem, score saved on this phone'); }
     session.entryId = entry.id; session.entry = entry; session.name = name;
-    submitting = false; $('#btnSubmitName').disabled = false; $('#btnSubmitName').textContent = 'SUBMIT SCORE';
+    if (Leaderboard.online){
+      session.pendingAdd = Leaderboard.add(entry, CFG.LEADERBOARD_SIZE)
+        .then(j => { session.serverToday = j; })
+        .catch(async () => { await LocalBoard.add(entry); Pending.push(entry); session.offline = true; toast('Weak connection, your score will be sent automatically'); });
+    } else { await LocalBoard.add(entry); }
     openBoard('after');
   }
   $('#btnSubmitName').onclick = () => submitName(nameInput.value);
@@ -1132,18 +1143,39 @@ const UI = (() => {
   function openBoard(mode){ boardMode = mode; boardTab = 'today'; $('#boardBody').innerHTML = '<div class="empty">Loading champions…</div>'; $('#boardYours').innerHTML = ''; show('board'); renderBoard(); }
   async function renderBoard(){
     $('#tabToday').classList.toggle('on', boardTab === 'today'); $('#tabAll').classList.toggle('on', boardTab === 'all');
-    const token = ++boardToken, board = session.offline ? LocalBoard : Leaderboard;
-        let top = [], rank = -1, failed = false;
-    try { const b = await board.board(boardTab, CFG.LEADERBOARD_SIZE, session.entry); top = b.top; rank = b.rank; }
-    catch (e) { failed = true; }
-    if (token !== boardToken) return;
-    if (failed){ $('#boardBody').innerHTML = '<div class="empty">Can\'t reach the leaderboard. Check your connection and try again.</div>'; }
-    const myRank = rank - 1;
-    if (!failed) $('#boardBody').innerHTML = top.length ? `<table class="lb"><thead><tr><th>#</th><th>NAME</th><th>SCORE</th><th>TIME</th></tr></thead><tbody>${
-      top.map((e, i) => `<tr class="${i < 3 ? 'r' + (i + 1) : ''} ${e.id === session.entryId ? 'me' : ''}"><td>${i === 0 ? '👑' : i + 1}</td><td class="nm">${esc(e.name)}</td><td>${fmt(e.score)}</td><td>${e.time != null ? e.time.toFixed(2) + 's' : '—'}</td></tr>`).join('')
+    const token = ++boardToken, n = CFG.LEADERBOARD_SIZE;
+    paintActions();
+    // 1) saving in progress → show the board instantly with the player inserted
+    if (Leaderboard.online && !session.offline && session.pendingAdd && !session.serverToday && boardTab === 'today' && session.entry){
+      const pre = session.prefetch ? await session.prefetch : null;
+      if (token !== boardToken) return;
+      const others = pre ? pre.top.filter(e => e.id !== session.entry.id) : [];
+      const list = others.concat([session.entry]).sort(rankSort); const i = list.findIndex(e => e.id === session.entry.id);
+      paint(list.slice(0, n), i < n && pre ? i + 1 : 0, false);
+      await session.pendingAdd;
+      if (token === boardToken) renderBoard();
+      return;
+    }
+    // 2) official data
+    let top = [], rank = -1, failed = false;
+    if (boardTab === 'today' && session.serverToday && !session.offline){ top = session.serverToday.top; rank = session.serverToday.rank; }
+    else {
+      if (session.pendingAdd) await session.pendingAdd;
+      try { const b = await (session.offline ? LocalBoard : Leaderboard).board(boardTab, n, session.entry); top = b.top; rank = b.rank; }
+      catch (e) { failed = true; }
+      if (token !== boardToken) return;
+    }
+    paint(top, rank, failed);
+  }
+  function paint(top, rank, failed){
+    if (failed){ $('#boardBody').innerHTML = '<div class="empty">Can\'t reach the leaderboard. Check your connection and try again.</div>'; $('#boardYours').innerHTML = ''; return; }
+    $('#boardBody').innerHTML = top.length ? `<table class="lb"><thead><tr><th>#</th><th>NAME</th><th>SCORE</th><th>TIME</th></tr></thead><tbody>${
+      top.map((e, i) => `<tr class="${i < 3 ? 'r' + (i + 1) : ''} ${e.id === session.entryId ? 'me' : ''}"><td>${i === 0 ? '👑' : i + 1}</td><td class="nm">${esc(e.name)}</td><td>${fmt(e.score)}</td><td>${e.time != null ? (+e.time).toFixed(2) + 's' : '—'}</td></tr>`).join('')
     }</tbody></table>` : `<div class="empty">No champions yet today. Be the first on the board!</div>`;
-    const me = !failed && myRank >= 0 ? session.entry : null;
-    $('#boardYours').innerHTML = me ? `<div class="yours"><span><small>YOUR RESULT</small><b>#${myRank + 1}</b></span><span class="nm">${esc(me.name)}</span><b>${fmt(me.score)}</b><span>${me.time != null ? me.time.toFixed(2) + 's' : ''}</span></div>` : '';
+    const me = rank === 0 || rank > 0 ? session.entry : null;   // rank 0 = saving, rank unknown yet
+    $('#boardYours').innerHTML = me ? `<div class="yours"><span><small>YOUR RESULT</small><b>${rank > 0 ? '#' + rank : '#…'}</b></span><span class="nm">${esc(me.name)}</span><b>${fmt(me.score)}</b><span>${me.time != null ? me.time.toFixed(2) + 's' : ''}</span></div>` : '';
+  }
+  function paintActions(){
     const acts = $('#boardActions');
     if (boardMode === 'after' && G.result && G.result.tier){
       acts.innerHTML = `<button class="btn" id="bdCode">🎁 SHOW MY REWARD CODE</button>`; $('#bdCode').onclick = openReward;
@@ -1298,7 +1330,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) Sfx.a
   const fonts = document.fonts ? Promise.race([document.fonts.ready, new Promise(r => setTimeout(r, 1500))]) : Promise.resolve();
   await Promise.all([...imgs, fonts]);
   await new Promise(r => setTimeout(r, Math.max(0, 700 - (performance.now() - t0))));
-  FX.resize(); UI.goHome(); route();
+  FX.resize(); UI.goHome(); route(); Pending.flush();
 })();
 </script>
 </body>

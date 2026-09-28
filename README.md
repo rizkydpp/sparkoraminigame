@@ -3,10 +3,11 @@
 | File | Fungsi |
 |---|---|
 | `index.html` | Game (dibuka customer dari QR di HP) |
-| `display.html` | Layar besar resto: QR + leaderboard live → buka `/tv` |
+| `tv/index.html` | Layar besar resto: QR + leaderboard live → buka `/tv` |
+| `display.html` | Sama dengan layar TV (cadangan, `/display`) |
 | `config.js` | **Satu-satunya file yang perlu diedit**: URL Google Sheet API, URL game, reward |
 | `Code.gs` | Script untuk Google Sheet (dipaste di Apps Script) |
-| `vercel.json` | Routing `/admin`, `/tv`, `/display` |
+| `vercel.json` | Routing `/admin` |
 
 Kalau `SHEET_API_URL` masih kosong, semuanya tetap jalan: leaderboard tersimpan di masing-masing HP, dan layar TV menampilkan DATA DEMO.
 
@@ -46,7 +47,7 @@ Cek:
 ## 3. Layar besar resto
 
 1. Chrome → `https://sparkoraminigame.vercel.app/tv` → klik sekali (fullscreen + layar tidak sleep).
-2. Update otomatis tiap ±8 detik. Ada skor baru → banner "🔥 NAMA scored ...".
+2. Update otomatis tiap ±8 detik (ditambah waktu Google Sheets ±1–3 detik). Ada skor baru → banner "🔥 NAMA scored ...".
 3. Menampilkan juara **hari ini** (zona waktu Jakarta), reset otomatis tengah malam.
 4. Internet putus → muncul **RECONNECTING**, lalu lanjut sendiri.
 5. Windows kiosk: `chrome.exe --kiosk https://sparkoraminigame.vercel.app/tv`
@@ -63,7 +64,8 @@ Cek:
 
 ## Catatan
 
-- Google Sheets lebih lambat dari database biasa: submit skor ±1–3 detik, TV update ±8–10 detik. Untuk promo resto ini cukup.
+- Submit nama di HP langsung tampil (<1 detik): leaderboard sudah diambil diam-diam selama pemain mengetik nama, lalu skor dikirim ke Google Sheets di belakang layar. Kalau sinyal jelek, skor disimpan dulu di HP dan dikirim ulang otomatis.
+- TV update ±8–12 detik setelah submit (batasan kecepatan Google Sheets).
 - Script menolak skor tidak wajar (> 8.000, waktu < 3 detik, dll.) dan membersihkan nama dari formula (`=`, `+`, `-`, `@`). Orang yang paham teknis tetap bisa mengirim skor palsu yang masih "wajar" — untuk Special Merchandise, cocokkan kode di HP dengan sheet **Rewards**.
 - Batas 1 reward/HP/hari masih dicek di HP (bisa dilewati dengan clear browser data).
 

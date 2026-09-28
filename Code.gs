@@ -85,6 +85,7 @@ function add_(p) {
   const name = clean_(p.name, 16) || 'SPARKORA FAN';
   const outlet = clean_(p.outlet, 40);
 
+  let dup = false;
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
@@ -93,15 +94,18 @@ function add_(p) {
     if (last > 1) {   // ignore double-submits of the same game
       const n = Math.min(200, last - 1);
       const ids = sh.getRange(last - n + 1, 3, n, 1).getValues().map(r => String(r[0]));
-      if (ids.indexOf(id) >= 0) return { ok: true, duplicate: true };
+      if (ids.indexOf(id) >= 0) dup = true;
     }
-    const now = new Date();
-    sh.appendRow([now, Utilities.formatDate(now, TZ, 'yyyy-MM-dd'), id, name, score, time, taps, outlet, '']);
-    CacheService.getScriptCache().put('ver', String(now.getTime()), 21600);   // invalidate cached boards
+    if (!dup) {
+      const now = new Date();
+      sh.appendRow([now, Utilities.formatDate(now, TZ, 'yyyy-MM-dd'), id, name, score, time, taps, outlet, '']);
+      CacheService.getScriptCache().put('ver', String(now.getTime()), 21600);   // invalidate cached boards
+    }
   } finally {
     lock.releaseLock();
   }
-  return { ok: true };
+  // answer with today's board + the player's rank, so the phone needs no second request
+  return board_({ scope: 'today', limit: p.limit, outlet: outlet, id: id });
 }
 
 /* ---------------- write: reward code log ---------------- */
